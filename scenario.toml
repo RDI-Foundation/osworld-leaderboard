@@ -1,6 +1,6 @@
 [green_agent]
 image = "ghcr.io/pro-wh/osworld-green:latest"
-env = { LOG_LEVEL = "INFO" }
+env = {}
 
 [[participants]]
 image = "ghcr.io/pro-wh/osworld-dummy-purple:latest"
