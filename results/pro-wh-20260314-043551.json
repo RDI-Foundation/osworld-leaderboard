@@ -1,0 +1,20 @@
+{
+  "participants": {},
+  "results": [
+    {
+      "overall": 0.005039498081037325,
+      "per_domain": {
+        "chrome": 0.0,
+        "gimp": 0.0,
+        "libreoffice_calc": 0.0,
+        "libreoffice_impress": 0.0,
+        "libreoffice_writer": 0.0,
+        "multi_apps": 0.00880923448660725,
+        "os": 0.041666666666666664,
+        "thunderbird": 0.0,
+        "vlc": 0.0,
+        "vs_code": 0.0
+      }
+    }
+  ]
+}

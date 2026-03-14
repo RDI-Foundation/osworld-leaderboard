@@ -1,0 +1,17 @@
+{
+  "image_digests": {
+    "green-agent": "ghcr.io/pro-wh/osworld-green@sha256:c77738000c09edfed9214fb3d8cf259712dd2130cedfdced03ba4d1f94bf3552",
+    "agent": "ghcr.io/pro-wh/osworld-dummy-purple@sha256:d624eb53e05b4615c4ca5a0357b37797217a7ee7e874c4e526c74d8a02642638",
+    "agentbeats-client": "ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e"
+  },
+  "timestamp": "2026-03-14T04:35:51Z",
+  "github_actions": {
+    "run_url": "https://github.com/pro-wh/osworld-leaderboard/actions/runs/23075177462",
+    "run_logs_url": "https://api.github.com/repos/pro-wh/osworld-leaderboard/actions/runs/23075177462/logs",
+    "ref": "refs/heads/run",
+    "sha": "27dae7fecfac6bf49e1fe2a539392b0ed29e3d67",
+    "repository_url": "https://github.com/pro-wh/osworld-leaderboard",
+    "workflow_ref": "pro-wh/osworld-leaderboard/.github/workflows/run-scenario.yml@refs/heads/run",
+    "workflow_sha": "27dae7fecfac6bf49e1fe2a539392b0ed29e3d67"
+  }
+}
