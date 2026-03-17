@@ -3,7 +3,7 @@ image = "ghcr.io/pro-wh/osworld-green:latest"
 env = {}
 
 [[participants]]
-image = "ghcr.io/pro-wh/osworld-dummy-purple:latest"
+image = "ghcr.io/pro-wh/osworld-purple:latest"
 name = "agent"
 
 [participants.env]
