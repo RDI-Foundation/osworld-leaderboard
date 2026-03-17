@@ -5,7 +5,9 @@ env = {}
 [[participants]]
 image = "ghcr.io/pro-wh/osworld-dummy-purple:latest"
 name = "agent"
-env = { LOG_LEVEL = "INFO" }
+
+[participants.env]
+MAX_CONTEXTS = "5"
 
 [config]
 # Add your assessment config here
