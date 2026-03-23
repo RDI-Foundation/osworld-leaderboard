@@ -49,7 +49,7 @@ def main():
     overall_sum = 0.0
     overall_count = 0
     per_domain: dict = {}
-    participants = {}
+    participants = None
 
     local_github_actions = collect_github_actions_metadata()
     image_digests = None
@@ -66,7 +66,14 @@ def main():
         # Aggregate results
         with open(os.path.join(base, "results.json")) as f:
             data = json.load(f)
-        participants = data.get("participants", participants)
+        shard_participants = data.get("participants", {})
+        if participants is None:
+            participants = shard_participants
+        elif shard_participants != participants:
+            print(f"Error: participants mismatch in {shard_dir}")
+            print(f"  Expected: {participants}")
+            print(f"  Got:      {shard_participants}")
+            sys.exit(1)
         for result in data.get("results", []):
             o = result["overall"]
             overall_sum += o["sum"]
