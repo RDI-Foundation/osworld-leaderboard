@@ -7,12 +7,19 @@ name: Quick-Submit Amber Runner
 on:
   workflow_call:
 
+env:
+  NUM_SHARDS: 4
+
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-      contents: write
+      contents: read
+
+    strategy:
+      matrix:
+        shard_index: [0, 1, 2, 3]  # must have range 0, ..., NUM_SHARDS - 1
 
     env:
       AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
@@ -167,14 +174,39 @@ jobs:
           console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
           NODE
 
+      - name: Patch scenario with shard config
+        shell: bash
+        env:
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          NUM_SHARDS: ${{ env.NUM_SHARDS }}
+          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+        run: |
+          set -euo pipefail
+          # Inject shard_index and num_shards into the gateway's assessment_config,
+          # which the gateway forwards to the green agent's EvalRequest config.
+          jq --argjson shard_index "$SHARD_INDEX" --argjson num_shards "$NUM_SHARDS" \
+            '.components.gateway.config.assessment_config.shard_index = $shard_index |
+             .components.gateway.config.assessment_config.num_shards = $num_shards' \
+            "$SCENARIO_PATH" > scenario-shard.json
+
       - name: Compile scenario
         run: |
           docker run --rm --user "$(id -u):$(id -g)" \
             -v "${{ github.workspace }}:/work" \
             ghcr.io/rdi-foundation/amber-cli:v0 \
-            compile "/work/${{ steps.scenario.outputs.path }}" \
+            compile "/work/scenario-shard.json" \
               --output /work/scenario-ir.json \
               --compose /work/docker-compose.yml
+
+      - name: Patch docker-compose for KVM
+        run: |
+          # amber-cli doesn't support KVM passthrough, so we patch the generated compose.
+          # Add /dev/kvm device and its GID to the c3-green service.
+          kvm_gid=$(stat -c %g /dev/kvm)
+          yq -i \
+            ".services[\"c3-green\"].devices = [\"/dev/kvm:/dev/kvm\"] |
+             .services[\"c3-green\"].group_add = [\"${kvm_gid}\"]" \
+            docker-compose.yml
 
       - name: Run scenario
         run: |
@@ -242,6 +274,151 @@ jobs:
                 workflow_ref: $workflow_ref,
                 workflow_sha: $workflow_sha
               }
+            }' > provenance.json
+
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            results.json
+            provenance.json
+
+  submit:
+    runs-on: ubuntu-latest
+    needs: run
+    permissions:
+      id-token: write
+      contents: write
+
+    env:
+      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Resolve submission ID
+        id: submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+          if [[ "$ref_name" =~ ^quick-submit-([0-9a-fA-F-]{36})$ ]]; then
+            echo "submission_id=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Unable to derive submission ID from branch: $ref_name" >&2
+          exit 1
+
+      - name: Find scenario file
+        id: scenario
+        shell: bash
+        env:
+          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
+        run: |
+          set -euo pipefail
+          scenario=$(ls submissions/*"${SUBMISSION_ID}"*.json 2>/dev/null | grep -v provenance | head -1)
+          if [[ -z "$scenario" ]]; then
+            echo "No scenario file found for submission ${SUBMISSION_ID}" >&2
+            exit 1
+          fi
+          base=$(basename "$scenario" .json)
+          echo "path=$scenario" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch GitHub OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
+
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shard-results
+
+      - name: Aggregate shard results
+        run: |
+          # Sum up overall and per_domain sum/count across shards, then compute success_rate.
+          # results[0].overall and results[0].per_domain values are {sum, count} objects,
+          # matching the format produced by the green agent and expected by the leaderboard.
+          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/results.json"; done)
+          # Verify participants are identical across all shards
+          expected_participants=$(jq '.participants' shard-results/shard-0/results.json)
+          for shard_file in $shard_files; do
+            got=$(jq '.participants' "$shard_file")
+            if [ "$got" != "$expected_participants" ]; then
+              echo "Error: participants mismatch in $shard_file" >&2
+              exit 1
+            fi
+          done
+          jq -s '
+            (map(.results[0])) as $shards |
+            ($shards | map(.overall.sum) | add) as $sum |
+            ($shards | map(.overall.count) | add) as $count |
+            {
+              participants: (.[0].participants // {}),
+              results: [{
+                overall: {sum: $sum, count: $count},
+                success_rate: (if $count > 0 then $sum / $count else 0.0 end),
+                per_domain: (
+                  $shards | map(.per_domain) | reduce .[] as $d ({};
+                    . as $acc | reduce ($d | keys[]) as $k ($acc;
+                      .[$k].sum += $d[$k].sum |
+                      .[$k].count += $d[$k].count
+                    )
+                  )
+                )
+              }]
+            }
+          ' $shard_files > results.json
+
+      - name: Aggregate provenance
+        run: |
+          # image_digests and github_actions must be identical across shards;
+          # collect shard_timestamps and shard_manifest_digests arrays.
+          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/provenance.json"; done)
+          expected_image_digests=$(jq '.image_digests' shard-results/shard-0/provenance.json)
+          expected_github_actions=$(jq '.github_actions' shard-results/shard-0/provenance.json)
+          timestamps='[]'
+          manifest_digests='[]'
+          for shard_file in $shard_files; do
+            got=$(jq '.image_digests' "$shard_file")
+            if [ "$got" != "$expected_image_digests" ]; then
+              echo "Error: image_digests mismatch in $shard_file" >&2; exit 1
+            fi
+            got=$(jq '.github_actions' "$shard_file")
+            if [ "$got" != "$expected_github_actions" ]; then
+              echo "Error: github_actions mismatch in $shard_file" >&2; exit 1
+            fi
+            ts=$(jq '.timestamp' "$shard_file")
+            timestamps=$(echo "$timestamps" | jq --argjson ts "$ts" '. + [$ts]')
+            md=$(jq '.manifest_digests' "$shard_file")
+            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$md" '. + [$md]')
+          done
+          jq -n \
+            --argjson image_digests "$expected_image_digests" \
+            --argjson shard_manifest_digests "$manifest_digests" \
+            --argjson shard_timestamps "$timestamps" \
+            --argjson github_actions "$expected_github_actions" \
+            '{
+              image_digests: $image_digests,
+              shard_manifest_digests: $shard_manifest_digests,
+              shard_timestamps: $shard_timestamps,
+              github_actions: $github_actions
             }' > provenance.json
 
       - name: Commit results
