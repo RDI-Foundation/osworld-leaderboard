@@ -199,17 +199,6 @@ jobs:
             echo "Scenario does not use framework.docker"
           fi
 
-      - name: Patch docker-compose for KVM
-        run: |
-          # amber-cli doesn't support KVM passthrough, so we patch the generated compose.
-          # Add /dev/kvm device and its GID to the green component service (identified by amber_component_moniker label).
-          green_service=$(yq '.services | to_entries | map(select(.value.labels.amber_component_moniker == "/green")) | .[0].key' "${AMBER_COMPOSE_DIR}/compose.yaml")
-          kvm_gid=$(stat -c %g /dev/kvm)
-          yq -i \
-            ".services[\"${green_service}\"].devices = [\"/dev/kvm:/dev/kvm\"] |
-             .services[\"${green_service}\"].group_add = [\"${kvm_gid}\"]" \
-            "${AMBER_COMPOSE_DIR}/compose.yaml"
-
       - name: Run scenario
         shell: bash
         run: |
