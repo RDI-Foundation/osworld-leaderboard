@@ -1,6 +1,6 @@
-# Reusable workflow - called from leaderboard repos via quick-submit.yml (@v1).
-# After making changes, move the tag so leaderboard repos using @v1 pick up the update:
-#   git tag -f v1 && git push origin v1 --force
+# Reusable workflow - called from leaderboard repos via quick-submit.yml.
+# After making changes, move the tag so leaderboard repos using @v2 pick up the update:
+#   git tag -f v2 && git push origin v2 --force
 
 name: Quick-Submit Amber Runner
 
@@ -13,6 +13,10 @@ on:
         type: string
       num_shards:
         description: Number of parallel shards to run (default 1)
+        required: false
+        type: number
+      num_instances:
+        description: Total number of task instances to run across all shards (default all)
         required: false
         type: number
     secrets:
@@ -28,29 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       shard_indices: ${{ steps.gen.outputs.shard_indices }}
+      scenario_path: ${{ steps.scenario.outputs.path }}
+      scenario_base: ${{ steps.scenario.outputs.base }}
+      submission_id: ${{ steps.submission.outputs.submission_id }}
     steps:
-      - id: gen
-        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
-
-  run:
-    needs: setup
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    strategy:
-      matrix:
-        shard_index: ${{ fromJson(needs.setup.outputs.shard_indices) }}
-
-    env:
-      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '30' }}
-      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
-      AMBER_COMPOSE_DIR: amber-compose
-      AMBER_COMPOSE_PROJECT: amber-quick-submit-${{ github.run_id }}-${{ github.run_attempt }}
-      AMBER_PROXY_PORT: "18080"
-
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref }}
 
@@ -83,6 +69,171 @@ jobs:
           echo "path=$scenario" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
+      - id: gen
+        run: echo "shard_indices=$(seq 0 $(( ${{ inputs.num_shards || 1 }} - 1 )) | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  eval:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      matrix:
+        shard_index: ${{ fromJSON(needs.setup.outputs.shard_indices) }}
+      fail-fast: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AGENTBEATS_URL: ${{ inputs.backend_url || vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/352582078246/locations/global/workloadIdentityPools/agentbeats-prod/providers/github' }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'agentbeats-prod-quick-submit@komyo-agentbeats.iam.gserviceaccount.com' }}
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      AMBER_COMPOSE_DIR: amber-compose
+      AMBER_COMPOSE_PROJECT: amber-qs-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard_index }}
+      AMBER_PROXY_PORT: "18080"
+      RESULTS_TIMEOUT_MINUTES: ${{ vars.QUICK_SUBMIT_TIMEOUT_MINUTES || '300' }}
+
+    steps:
+      - name: Free disk space
+        # GitHub-hosted runners ship with ~20-30 GB of pre-installed toolchains
+        # (.NET, Android SDK, GraalVM, Chromium, etc.) not needed.
+        # Benchmark scenarios often pull large Docker images.
+        # See https://github.com/marketplace/actions/free-disk-space-ubuntu
+        run: |
+          echo "Before: $(df -h / | tail -1 | awk '{print $4}') free"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/chromium /usr/local/graalvm /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "After: $(df -h / | tail -1 | awk '{print $4}') free"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+
+      # Secrets (OIDC → backend → GCP KMS → decrypt).
+      # Skipped when no backend is configured (e.g. test repos using GREEN_SECRETS_JSON).
+      - name: Fetch GitHub OIDC token
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch secrets bundle
+        id: bundle
+        shell: bash
+        env:
+          BACKEND_URL: ${{ env.AGENTBEATS_URL }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          secrets_url="${BACKEND_URL}/api/quick-submit/${SUBMISSION_ID}/secrets"
+          http_code="$(curl -sS -o secrets_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" "$secrets_url" || true)"
+          if [[ "$http_code" != "200" ]]; then
+            echo "Backend returned HTTP ${http_code}:" >&2
+            cat secrets_response.json >&2; exit 1
+          fi
+          echo "secrets_blob_b64=$(jq -r '.secrets_blob' secrets_response.json)" >> "$GITHUB_OUTPUT"
+          echo "wrapped_dek_b64=$(jq -r '.wrapped_dek' secrets_response.json)" >> "$GITHUB_OUTPUT"
+          echo "iv_b64=$(jq -r '.metadata.iv' secrets_response.json)" >> "$GITHUB_OUTPUT"
+          echo "key_id=$(jq -r '.metadata.key_id' secrets_response.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP
+        id: gcp-auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Unwrap DEK via KMS
+        id: dek
+        shell: bash
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          KMS_KEY_ID: ${{ steps.bundle.outputs.key_id }}
+          WRAPPED_DEK_B64: ${{ steps.bundle.outputs.wrapped_dek_b64 }}
+        run: |
+          set -euo pipefail
+          kms_url="https://cloudkms.googleapis.com/v1/${KMS_KEY_ID}:asymmetricDecrypt"
+          http_code="$(curl -sS -o kms_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GCP_ACCESS_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"ciphertext\":\"${WRAPPED_DEK_B64}\"}" "$kms_url" || true)"
+          if [[ "$http_code" != "200" ]]; then
+            echo "KMS returned HTTP ${http_code}:" >&2
+            cat kms_response.json >&2; exit 1
+          fi
+          dek_b64="$(jq -r '.plaintext' kms_response.json)"
+          echo "::add-mask::$dek_b64"
+          echo "dek_b64=$dek_b64" >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt and export secrets
+        id: submitter-secrets
+        shell: bash
+        env:
+          DEK_B64: ${{ steps.dek.outputs.dek_b64 }}
+          IV_B64: ${{ steps.bundle.outputs.iv_b64 }}
+          CIPHERTEXT_B64: ${{ steps.bundle.outputs.secrets_blob_b64 }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const crypto = require('crypto');
+
+          const dek = Buffer.from(process.env.DEK_B64, 'base64');
+          const iv = Buffer.from(process.env.IV_B64, 'base64');
+          const ciphertextAndTag = Buffer.from(process.env.CIPHERTEXT_B64, 'base64');
+
+          const tag = ciphertextAndTag.subarray(ciphertextAndTag.length - 16);
+          const ciphertext = ciphertextAndTag.subarray(0, ciphertextAndTag.length - 16);
+
+          const decipher = crypto.createDecipheriv('aes-256-gcm', dek, iv);
+          decipher.setAuthTag(tag);
+          const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+          const secrets = JSON.parse(plaintext.toString('utf8'));
+
+          // Export all secrets as env vars with AMBER_CONFIG_ prefix (green + participant secrets)
+          const fs = require('fs');
+          const envFile = process.env.GITHUB_ENV;
+
+          function exportSecret(key, value) {
+            console.log(`::add-mask::${value}`);
+            fs.appendFileSync(envFile, `AMBER_CONFIG_${key}=${value}\n`);
+          }
+
+          for (const [key, value] of Object.entries(secrets.green || {})) {
+            exportSecret(`GREEN_${key}`, value);
+          }
+          for (const participant of secrets.participants || []) {
+            const prefix = participant.name.toUpperCase();
+            for (const [key, value] of Object.entries(participant.secrets || {})) {
+              exportSecret(`${prefix}_${key}`, value);
+            }
+          }
+          const greenKeys = Object.keys(secrets.green || {})
+            .map((key) => key.toLowerCase())
+            .sort();
+          const outputFile = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(outputFile, `green_keys_json=${JSON.stringify(greenKeys)}\n`);
+
+          console.log(`Exported ${Object.keys(secrets.green || {}).length} green secrets`);
+          console.log(`Exported secrets for ${(secrets.participants || []).length} participants`);
+          NODE
+
       - name: Export repo-owned green secrets
         shell: bash
         env:
@@ -93,6 +244,7 @@ jobs:
           node - <<'NODE'
           const crypto = require('crypto');
           const fs = require('fs');
+
           const raw = process.env.GREEN_SECRETS_JSON?.trim();
           if (!raw) {
             console.log('No repo-owned green secrets configured');
@@ -151,9 +303,7 @@ jobs:
           set -euo pipefail
           docker pull "${AMBER_IMAGE}"
           cid="$(docker create "${AMBER_IMAGE}")"
-          cleanup() {
-            docker rm "${cid}" >/dev/null 2>&1 || true
-          }
+          cleanup() { docker rm "${cid}" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           install -d "${RUNNER_TEMP}/bin"
           docker cp "${cid}:/amber" "${RUNNER_TEMP}/bin/amber"
@@ -161,51 +311,33 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/amber" --help >/dev/null
 
-      - name: Patch scenario with shard config
-        shell: bash
-        env:
-          SHARD_INDEX: ${{ matrix.shard_index }}
-          NUM_SHARDS: ${{ env.NUM_SHARDS }}
-          SCENARIO_PATH: ${{ steps.scenario.outputs.path }}
+      - name: Patch shard config into scenario
         run: |
-          set -euo pipefail
-          # Inject shard_index and num_shards into the gateway's assessment_config,
-          # which the gateway forwards to the green agent's EvalRequest config.
-          jq --argjson shard_index "$SHARD_INDEX" --argjson num_shards "$NUM_SHARDS" \
-            '.components.gateway.config.assessment_config.shard_index = $shard_index |
-             .components.gateway.config.assessment_config.num_shards = $num_shards' \
-            "$SCENARIO_PATH" > scenario-shard.json
+          jq --argjson shard_index ${{ matrix.shard_index }} \
+             --argjson num_shards ${NUM_SHARDS} \
+             --argjson num_instances '${{ inputs.num_instances || 'null' }}' \
+            '
+             .components.gateway.config.assessment_config.shard_index = $shard_index |
+             .components.gateway.config.assessment_config.num_shards = $num_shards |
+             if $num_instances then .components.gateway.config.assessment_config.num_instances = $num_instances else . end
+            ' \
+            "${{ needs.setup.outputs.scenario_path }}" > patched.json
+          mv patched.json "${{ needs.setup.outputs.scenario_path }}"
 
       - name: Compile scenario
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "${AMBER_COMPOSE_DIR}"
-          amber compile scenario-shard.json \
+          amber compile "${{ needs.setup.outputs.scenario_path }}" \
             --output scenario-ir.json \
             --docker-compose "${AMBER_COMPOSE_DIR}"
           if ! jq -e '.exports[] | select(.name == "results" and .capability.kind == "http")' scenario-ir.json > /dev/null; then
             echo "Scenario must export an HTTP capability named 'results'" >&2
             exit 1
           fi
-          if jq -e '.. | objects | select(.kind? == "docker")' scenario-ir.json > /dev/null; then
-            if [[ ! -S /var/run/docker.sock ]]; then
-              echo "Scenario uses framework.docker but /var/run/docker.sock is unavailable" >&2
-              exit 1
-            fi
-            echo "Scenario uses framework.docker; exporting /var/run/docker.sock to Docker Compose"
-            echo "AMBER_DOCKER_SOCK=/var/run/docker.sock" >> "${GITHUB_ENV}"
-          else
-            echo "Scenario does not use framework.docker"
-          fi
-          if jq -e '.. | objects | select(.kind? == "kvm")' scenario-ir.json > /dev/null; then
-            echo "Scenario uses framework.kvm; exporting AMBER_KVM_GID to Docker Compose"
-            echo "AMBER_KVM_GID=$(stat -c %g /dev/kvm)" >> "${GITHUB_ENV}"
-          else
-            echo "Scenario does not use framework.kvm"
-          fi
 
-      - name: Run scenario
+      - name: Run scenario — shard-${{ matrix.shard_index }}
         shell: bash
         run: |
           set -euo pipefail
@@ -231,6 +363,45 @@ jobs:
             exit "${exit_code}"
           }
           trap cleanup EXIT
+
+          # Pull images before starting provenance.
+          "${compose[@]}" pull --quiet
+
+          # Generate provenance (image digests + manifest digests).
+          # All shards compile the same scenario and pull the same images,
+          # so provenance is identical; summary picks one.
+          image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
+            digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
+            printf '%s\t%s\n' "$name" "$digest"
+          done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
+          manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          mkdir -p amber-compose/output
+          jq -n \
+            --argjson image_digests "$image_digests" \
+            --argjson manifest_digests "$manifest_digests" \
+            --arg timestamp "$timestamp" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg repository_url "${{ github.server_url }}/${{ github.repository }}" \
+            --arg workflow_ref "${{ github.workflow_ref }}" \
+            --arg workflow_sha "${{ github.workflow_sha }}" \
+            '{
+              image_digests: $image_digests,
+              manifest_digests: $manifest_digests,
+              timestamp: $timestamp,
+              github_actions: {
+                run_url: $run_url,
+                ref: $ref,
+                sha: $sha,
+                repository_url: $repository_url,
+                workflow_ref: $workflow_ref,
+                workflow_sha: $workflow_sha
+              }
+            }' > amber-compose/output/provenance.json
+          echo "Provenance:"
+          cat amber-compose/output/provenance.json
 
           "${compose[@]}" up -d
           "${compose[@]}" logs -f --no-color &
@@ -263,193 +434,142 @@ jobs:
               continue
             fi
             if [[ "${status}" != "running" ]]; then
-              jq . <<<"${response}" > results.json
-              echo "Scenario finished with status: ${status}"
+              mkdir -p amber-compose/output
+              jq . <<<"${response}" > amber-compose/output/results.json
+              echo "Shard ${{ matrix.shard_index }} finished with status: ${status}"
               break
             fi
             sleep 5
           done
-          if [[ ! -f results.json ]]; then
-            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for scenario results" >&2
+          if [[ ! -f amber-compose/output/results.json ]]; then
+            echo "Timed out waiting ${RESULTS_TIMEOUT_MINUTES} minutes for shard results" >&2
             exit 1
           fi
           if [[ "${status}" != "completed" ]]; then
+            echo "Batch failed:" >&2
+            cat amber-compose/output/results.json >&2
             exit 1
           fi
+        timeout-minutes: 300
 
       - name: Stop scenario
         if: always()
+        run: docker compose -f amber-compose/compose.yaml -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shard-${{ matrix.shard_index }}
+          path: |
+            amber-compose/output/results.json
+            amber-compose/output/provenance.json
+
+  summary:
+    needs: [setup, eval]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    defaults:
+      run:
         shell: bash
+    env:
+      AGENTBEATS_URL: ${{ vars.QUICK_SUBMIT_BACKEND_URL || 'https://agentbeats.dev' }}
+      OIDC_AUDIENCE: ${{ vars.QUICK_SUBMIT_OIDC_AUDIENCE || 'agentbeats-quick-submit-production' }}
+      SCENARIO_PATH: ${{ needs.setup.outputs.scenario_path }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: shard-artifacts
+          pattern: shard-*
+          merge-multiple: false
+
+      - name: Aggregate results
         run: |
           set -euo pipefail
-          docker compose -f "${AMBER_COMPOSE_DIR}/compose.yaml" -p "${AMBER_COMPOSE_PROJECT}" down -v --remove-orphans
+          # Single-artifact downloads extract flat; normalize to subdirs
+          if [[ -f "shard-artifacts/results.json" && ! -d "shard-artifacts/shard-0" ]]; then
+            mkdir -p shard-artifacts/shard-0
+            mv shard-artifacts/results.json shard-artifacts/shard-0/
+            mv shard-artifacts/provenance.json shard-artifacts/shard-0/ 2>/dev/null || true
+          fi
+          # Build expected file paths from shard count
+          shard_results=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/results.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing results for shard ${i}" >&2
+              ls -R shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_results+=("$f")
+          done
+          # Extract participants (agentbeats IDs) from submission metadata
+          participants=$(jq '.metadata.agentbeats_ids // {}' "${SCENARIO_PATH}")
+          jq -s --argjson participants "$participants" '{
+            status: (if all(.[]; .status == "completed") then "completed"
+                    elif any(.[]; .status == "completed") then "partial"
+                    else "failed" end),
+            participants: $participants,
+            results: [.[].results[]]
+          }' "${shard_results[@]}" > results.json
 
-      - name: Add participants to results
+      - name: Validate and merge provenance
         run: |
-          participants=$(jq '.metadata.agentbeats_ids // {}' "${{ steps.scenario.outputs.path }}")
-          jq --argjson participants "$participants" '. + {participants: $participants}' results.json > results-final.json
-          mv results-final.json results.json
-
-      - name: Generate provenance
-        run: |
-          image_digests=$(jq -r '.components[] | select(.program) | "\(.moniker)=\(.program.image)"' scenario-ir.json | while IFS='=' read -r name image; do
-            digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
-            printf '%s\t%s\n' "$name" "$digest"
-          done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
-          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          manifest_digests=$(jq '[.components[] | {(.moniker): .digest}] | add // {}' scenario-ir.json)
+          set -euo pipefail
+          # Build expected file paths from shard count
+          shard_provenance=()
+          for i in $(seq 0 $(( ${NUM_SHARDS} - 1 ))); do
+            f="shard-artifacts/shard-${i}/provenance.json"
+            if [[ ! -f "$f" ]]; then
+              echo "ERROR: missing provenance for shard ${i}" >&2
+              ls -R shard-artifacts/ >&2 || true
+              exit 1
+            fi
+            shard_provenance+=("$f")
+          done
+          # image_digests and github_actions must be identical across shards
+          expected_image_digests=$(jq '.image_digests' "${shard_provenance[0]}")
+          expected_github_actions=$(jq '.github_actions' "${shard_provenance[0]}")
+          timestamps='[]'
+          manifest_digests='[]'
+          for f in "${shard_provenance[@]}"; do
+            got=$(jq '.image_digests' "$f")
+            if [[ "$got" != "$expected_image_digests" ]]; then
+              echo "ERROR: image_digests mismatch in $f" >&2; exit 1
+            fi
+            got=$(jq '.github_actions' "$f")
+            if [[ "$got" != "$expected_github_actions" ]]; then
+              echo "ERROR: github_actions mismatch in $f" >&2; exit 1
+            fi
+            timestamps=$(echo "$timestamps" | jq --argjson ts "$(jq '.timestamp' "$f")" '. + [$ts]')
+            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$(jq '.manifest_digests' "$f")" '. + [$md]')
+          done
+          # Output the flat shape the backend expects (manifest_digests + timestamp),
+          # using the first shard's values (all shards are identical).
           jq -n \
-            --argjson image_digests "$image_digests" \
-            --argjson manifest_digests "$manifest_digests" \
-            --arg timestamp "$timestamp" \
-            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg ref "${{ github.ref }}" \
-            --arg sha "${{ github.sha }}" \
-            --arg repository_url "${{ github.server_url }}/${{ github.repository }}" \
-            --arg workflow_ref "${{ github.workflow_ref }}" \
-            --arg workflow_sha "${{ github.workflow_sha }}" \
+            --argjson image_digests "$expected_image_digests" \
+            --argjson manifest_digests "$(echo "$manifest_digests" | jq '.[0]')" \
+            --arg timestamp "$(echo "$timestamps" | jq -r '.[0]')" \
+            --argjson github_actions "$expected_github_actions" \
             '{
               image_digests: $image_digests,
               manifest_digests: $manifest_digests,
               timestamp: $timestamp,
-              github_actions: {
-                run_url: $run_url,
-                ref: $ref,
-                sha: $sha,
-                repository_url: $repository_url,
-                workflow_ref: $workflow_ref,
-                workflow_sha: $workflow_sha
-              }
-            }' > provenance.json
-
-      - name: Upload shard result
-        uses: actions/upload-artifact@v4
-        with:
-          name: shard-${{ matrix.shard_index }}
-          path: |
-            results.json
-            provenance.json
-
-  submit:
-    runs-on: ubuntu-latest
-    needs: run
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-
-      - name: Resolve submission ID
-        id: submission
-        shell: bash
-        run: |
-          set -euo pipefail
-          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
-          if [[ "$ref_name" =~ ^quick-submit-([0-9a-fA-F-]{36})$ ]]; then
-            echo "submission_id=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "Unable to derive submission ID from branch: $ref_name" >&2
-          exit 1
-
-      - name: Find scenario file
-        id: scenario
-        shell: bash
-        env:
-          SUBMISSION_ID: ${{ steps.submission.outputs.submission_id }}
-        run: |
-          set -euo pipefail
-          scenario=$(ls submissions/*"${SUBMISSION_ID}"*.json 2>/dev/null | grep -v provenance | head -1)
-          if [[ -z "$scenario" ]]; then
-            echo "No scenario file found for submission ${SUBMISSION_ID}" >&2
-            exit 1
-          fi
-          base=$(basename "$scenario" .json)
-          echo "path=$scenario" >> "$GITHUB_OUTPUT"
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-
-      - name: Download shard results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: shard-*
-          path: shard-results
-
-      - name: Aggregate shard results
-        run: |
-          # Sum up overall and per_domain sum/count across shards, then compute success_rate.
-          # results[0].overall and results[0].per_domain values are {sum, count} objects,
-          # matching the format produced by the green agent and expected by the leaderboard.
-          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/results.json"; done)
-          # Verify participants are identical across all shards
-          expected_participants=$(jq '.participants' shard-results/shard-0/results.json)
-          for shard_file in $shard_files; do
-            got=$(jq '.participants' "$shard_file")
-            if [ "$got" != "$expected_participants" ]; then
-              echo "Error: participants mismatch in $shard_file" >&2
-              exit 1
-            fi
-          done
-          jq -s '
-            (map(.results[0])) as $shards |
-            ($shards | map(.overall.sum) | add) as $sum |
-            ($shards | map(.overall.count) | add) as $count |
-            {
-              participants: (.[0].participants // {}),
-              results: [{
-                overall: {sum: $sum, count: $count},
-                success_rate: (if $count > 0 then $sum / $count else 0.0 end),
-                per_domain: (
-                  $shards | map(.per_domain) | reduce .[] as $d ({};
-                    . as $acc | reduce ($d | keys[]) as $k ($acc;
-                      .[$k].sum += $d[$k].sum |
-                      .[$k].count += $d[$k].count
-                    )
-                  )
-                )
-              }]
-            }
-          ' $shard_files > results.json
-
-      - name: Aggregate provenance
-        run: |
-          # image_digests and github_actions must be identical across shards;
-          # collect shard_timestamps and shard_manifest_digests arrays.
-          shard_files=$(for i in $(seq 0 $(( ${{ env.NUM_SHARDS }} - 1 ))); do echo "shard-results/shard-${i}/provenance.json"; done)
-          expected_image_digests=$(jq '.image_digests' shard-results/shard-0/provenance.json)
-          expected_github_actions=$(jq '.github_actions' shard-results/shard-0/provenance.json)
-          timestamps='[]'
-          manifest_digests='[]'
-          for shard_file in $shard_files; do
-            got=$(jq '.image_digests' "$shard_file")
-            if [ "$got" != "$expected_image_digests" ]; then
-              echo "Error: image_digests mismatch in $shard_file" >&2; exit 1
-            fi
-            got=$(jq '.github_actions' "$shard_file")
-            if [ "$got" != "$expected_github_actions" ]; then
-              echo "Error: github_actions mismatch in $shard_file" >&2; exit 1
-            fi
-            ts=$(jq '.timestamp' "$shard_file")
-            timestamps=$(echo "$timestamps" | jq --argjson ts "$ts" '. + [$ts]')
-            md=$(jq '.manifest_digests' "$shard_file")
-            manifest_digests=$(echo "$manifest_digests" | jq --argjson md "$md" '. + [$md]')
-          done
-          jq -n \
-            --argjson image_digests "$expected_image_digests" \
-            --argjson shard_manifest_digests "$manifest_digests" \
-            --argjson shard_timestamps "$timestamps" \
-            --argjson github_actions "$expected_github_actions" \
-            '{
-              image_digests: $image_digests,
-              shard_manifest_digests: $shard_manifest_digests,
-              shard_timestamps: $shard_timestamps,
               github_actions: $github_actions
             }' > provenance.json
+          echo "Provenance:"
+          cat provenance.json
 
       - name: Commit results
         env:
-          BASE: ${{ steps.scenario.outputs.base }}
+          BASE: ${{ needs.setup.outputs.scenario_base }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -459,3 +579,39 @@ jobs:
           git add "results/${BASE}.json" "submissions/${BASE}-provenance.json"
           git commit -m "[AgentBeats] Scenario results"
           git push
+
+      # Cleanup: delete secrets from backend.
+      # Skipped when no backend is configured.
+      - name: Fetch GitHub OIDC token
+        if: success()
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -r '.value' <<<"$oidc_response")"
+          if [[ -z "$oidc_token" || "$oidc_token" == "null" ]]; then
+            echo "Failed to fetch OIDC token" >&2; exit 1
+          fi
+          echo "::add-mask::$oidc_token"
+          echo "token=$oidc_token" >> "$GITHUB_OUTPUT"
+
+      - name: Delete secrets from backend
+        if: success()
+        shell: bash
+        env:
+          BACKEND_URL: ${{ env.AGENTBEATS_URL }}
+          SUBMISSION_ID: ${{ needs.setup.outputs.submission_id }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -euo pipefail
+          http_code="$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            "${BACKEND_URL}/api/quick-submit/${SUBMISSION_ID}/complete" || true)"
+          if [[ "$http_code" == "200" ]]; then
+            echo "Secrets deleted successfully"
+          else
+            echo "Warning: secrets cleanup returned HTTP ${http_code} (non-fatal)" >&2
+          fi
