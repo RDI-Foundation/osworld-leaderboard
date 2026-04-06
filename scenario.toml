@@ -8,6 +8,29 @@ name = "agent"
 
 [participants.env]
 MAX_CONTEXTS = "5"
+# MODEL = "..."
+# MAX_TOKENS = "..."
+# TOP_P = "..."
+# TEMPERATURE = "..."
+# MAX_TRAJECTORY_LENGTH = "..."
+# A11Y_TREE_MAX_TOKENS = "..."
+# AZURE_OPENAI_API_KEY = "${AZURE_OPENAI_API_KEY}"
+# AZURE_OPENAI_ENDPOINT = "${AZURE_OPENAI_ENDPOINT}"
+# OPENAI_BASE_URL = "${OPENAI_BASE_URL}"
+# OPENAI_API_KEY = "${OPENAI_API_KEY}"
+# ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+# TOGETHER_API_KEY = "${TOGETHER_API_KEY}"
+# GENAI_API_KEY = "${GENAI_API_KEY}"
+# GROQ_API_KEY = "${GROQ_API_KEY}"
 
 [config]
 # Add your assessment config here
+# action_space = "pyautogui"
+# observation_type = "screenshot"
+# sleep_after_execution = 0.0
+# max_steps = 15
+# test_all_meta_name = "test_nogdrive"
+# domain = null
+# num_shards = 1
+# shard_index = 0
+# num_workers = 3
